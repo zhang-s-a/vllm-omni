@@ -57,6 +57,7 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION, REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
@@ -65,6 +66,7 @@ from vllm_omni.platforms import current_omni_platform
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
+from .reference_isolation import reference_isolation_enabled
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -72,6 +74,7 @@ if TYPE_CHECKING:
     )
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from .reference_isolation import MiniMaxH3ReferenceIsolation
     from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 logger = init_logger(__name__)
@@ -332,6 +335,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "video_token_layout",
         "rope_table",
         "reference_kv_state",
+        REFERENCE_ISOLATION_STATE,
     }
 )
 
@@ -667,6 +671,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -716,7 +721,8 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                self.attention.attn_backend.supports_packed_mask_free()
+                reference_isolation is not None
+                or self.attention.attn_backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
                     and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
@@ -749,6 +755,8 @@ class MiniMaxH3Attention(nn.Module):
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if reference_isolation is not None and reference_isolation.reference_rows:
+            extra[REFERENCE_ISOLATION] = (reference_isolation, reference_kv_compact)
         if vdn_window is not None:
             extra["vdn_window"] = vdn_window
         if reference_kv_compact:
@@ -831,6 +839,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
@@ -884,6 +893,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         if self.vdn is not None:
@@ -1201,6 +1211,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
+        reference_isolation: MiniMaxH3ReferenceIsolation | None = None,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
@@ -1241,6 +1252,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_state=reference_kv_state,
             reference_kv_layer_index=self.layer_index,
             reference_kv_compact=reference_kv_compact,
+            reference_isolation=reference_isolation,
             vdn_window=vdn_window,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
@@ -1500,7 +1512,7 @@ class MiniMaxH3DiTModel(nn.Module):
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
         self.od_config = od_config
-        if getattr(od_config, "kv_offload_config", None) is not None:
+        if reference_isolation_enabled(od_config) or getattr(od_config, "kv_offload_config", None) is not None:
             from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import MiniMaxH3CachedAdapter
 
             self._cache_dit_adapter_config = replace(
@@ -1932,6 +1944,19 @@ class MiniMaxH3DiTModel(nn.Module):
     ) -> MiniMaxH3ReferenceKVTier2State | None:
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
+        if reference_isolation_enabled(self.od_config):
+            if getattr(self, "vdn_config", None) is not None:
+                raise ValueError("--kv-isolate does not support VDN-H3")
+            if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
+                raise ValueError("--kv-isolate requires no SP or pure Ulysses attention")
+            from .reference_isolation_cache import create_isolated_reference_cache
+            from .reference_kv_cache_dit import iter_minimax_h3_blocks
+
+            return create_isolated_reference_cache(
+                num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
+                global_reference_rows=global_reference_rows,
+                device=device,
+            )
         config = parse_reference_kv_config(getattr(self.od_config, "kv_offload_config", None))
         if config is None:
             return None
@@ -2000,6 +2025,14 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
         reference_kv_state = kwargs.get("reference_kv_state")
+        reference_isolation = kwargs.get(REFERENCE_ISOLATION_STATE)
+        if reference_isolation is None and reference_isolation_enabled(self.od_config):
+            raise ValueError("--kv-isolate requires full-loop inference; step execution is unsupported")
+        if reference_isolation is not None:
+            if self.vdn_config is not None:
+                raise ValueError("--kv-isolate does not support VDN-H3")
+            if kwargs.get("control_rows") is not None:
+                raise ValueError("--kv-isolate does not support ControlNet")
         vdn_window = None
         if self.vdn_config is not None:
             # Text rows lead the packed document.
@@ -2013,6 +2046,28 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
+        if reference_isolation is not None:
+            reference_isolation.validate_presentation(
+                sequence_rows=seq_len,
+                used_rows=max_seqlen,
+                num_requests=num_requests,
+            )
+            if not reference_isolation.geometry_ready:
+                dynamic_layout = (
+                    _compact_reference_video_layout(
+                        video_layout,
+                        reference_isolation.reference_positions,
+                        max_seqlen - reference_isolation.reference_rows,
+                    )
+                    if video_layout is not None
+                    else None
+                )
+                kv_layout = (
+                    _reference_kv_video_layout(video_layout, reference_isolation.reference_positions, dynamic_layout)
+                    if video_layout is not None
+                    else None
+                )
+                reference_isolation.set_video_geometry(dynamic_layout, kv_layout)
         local_span = self._rope_local_span(seq_len)
         local_start, local_len = local_span
         compact_reference = False
@@ -2168,6 +2223,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
                 reference_kv_state=reference_kv_state,
                 reference_kv_compact=compact_reference,
+                reference_isolation=reference_isolation,
                 vdn_window=vdn_window,
             )
         if local_len == seq_len:
