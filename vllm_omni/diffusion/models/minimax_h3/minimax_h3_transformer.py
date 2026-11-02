@@ -47,6 +47,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION, REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
@@ -57,7 +58,6 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION, REFERENCE_ISOLATION_STATE
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
@@ -65,8 +65,8 @@ from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
-from .vdnh3 import VDNConfig, VDNH3HybridAttention
 from .reference_isolation import reference_isolation_enabled
+from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -74,8 +74,9 @@ if TYPE_CHECKING:
     )
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from .reference_isolation import MiniMaxH3ReferenceIsolation
     from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
+
+    from .reference_isolation import MiniMaxH3ReferenceIsolation
 
 logger = init_logger(__name__)
 
@@ -1965,14 +1966,19 @@ class MiniMaxH3DiTModel(nn.Module):
         if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
             raise ValueError("MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention")
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
-        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
+        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import (
+            configure_reference_cache_schedule,
+            iter_minimax_h3_blocks,
+        )
 
-        return MiniMaxH3ReferenceKVTier2State.from_config(
+        state = MiniMaxH3ReferenceKVTier2State.from_config(
             config=config,
             num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
             global_reference_rows=global_reference_rows,
             device=device,
         )
+        configure_reference_cache_schedule(self.blocks, state)
+        return state
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
