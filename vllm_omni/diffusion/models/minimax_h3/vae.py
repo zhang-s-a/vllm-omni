@@ -34,6 +34,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
+from .npu.taeh3 import install_taeh3_decoder
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
@@ -367,6 +368,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             )
         install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
+        install_taeh3_decoder(
+            self.model,
+            device=device,
+            load_device=initial_device,
+            encode_only=self.encode_only,
+            latent_channels=int(self.config_dict["latent_channels"]),
+        )
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
@@ -403,8 +411,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device,
                 pin_memory=True,
             )
+            decoder_modules = [self.model.post_quant_conv, self.model.decoder]
+            taeh3 = getattr(self.model, "_omni_taeh3_decoder", None)
+            if taeh3 is not None:
+                decoder_modules.append(taeh3)
             self._decoder_stager = PinnedModuleStager(
-                [self.model.post_quant_conv, self.model.decoder],
+                decoder_modules,
                 device,
                 pin_memory=True,
             )
@@ -988,6 +1000,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        taeh3 = getattr(self.model, "_omni_taeh3_decoder", None)
+        if taeh3 is not None:
+            # TAE consumes normalized diffusion latents and emits [0, 1] RGB;
+            # applying native latent denormalization/revert here would be wrong.
+            with torch.autocast(latent.device.type, enabled=False):
+                frames = taeh3.decode_video(latent)
+            logger.info("MiniMax-H3 TAEH3 executed: latent=%s output=%s", tuple(latent.shape), tuple(frames.shape))
+            return frames
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
@@ -1034,6 +1054,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         if not callable(on_chunk):
             raise TypeError("on_chunk must be callable")
+        if getattr(self.model, "_omni_taeh3_decoder", None) is not None:
+            raise NotImplementedError("TAEH3 supports full-video decode; keep extra_params.preencode_mp4=false")
         if not callable(getattr(self.model, "_adaptive_decode", None)):
             raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
         group = None
