@@ -230,6 +230,37 @@ CUSTOM_DIT_ENABLERS.update(
 
 ---
 
+### MiniMax-H3 reference isolation
+
+MiniMax-H3's opt-in `--kv-isolate` path uses the existing reference-KV-aware
+Cache-DiT adapter even when `--kv-offload-config` is absent. It captures reference
+K/V once, then switches from full to compact hidden states. The adapter's
+history key includes the request's reference-state identity, epoch, isolation
+policy, layout, shape, dtype and device. A changed key clears residual and
+TaylorSeer history before permitting reuse; capture steps execute all blocks.
+
+This preserves the existing refresh-first scheduling behavior. Isolation does
+not introduce a Cache-DiT hit-priority scheduler, and its changed attention
+semantics require separate output-quality evaluation. See the
+[configuration and support limits](../../user_guide/diffusion_features.md#experimental-minimax-h3-reference-isolation).
+
+### MiniMax-H3 hit-priority reference refresh
+
+The optional `kv_offload_config.cache_dit_policy="hit"` coordinates a due
+reference refresh with the existing single MiniMax-H3 Cache-DiT wrapper.
+Before the maximum reference age, the compact prefix probe can keep a hit
+and postpone refresh. A miss requests one full-layout replay before the
+middle-block result and solver update are committed. A request/step-specific,
+single-use token prevents the replay from advancing the Cache-DiT clock again;
+calibrators are initialized after incompatible layout/version history is reset.
+The hard age limit takes precedence over hits. Pending copy-stream reads
+complete before the old Host reference data is overwritten.
+
+The default `refresh` policy is unchanged. Unsupported wrapper layouts or
+separate-CFG caching use the original fixed schedule. This policy does not
+isolate reference tokens or change the Host layout or sparse attention kernel.
+See the [configuration and tradeoffs](../../user_guide/diffusion_features.md#minimax-h3-reference-refresh-with-cache-dit).
+
 ## Testing
 
 After adding cache-dit support, test with:

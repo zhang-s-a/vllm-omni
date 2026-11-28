@@ -42,6 +42,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -586,10 +587,45 @@ class Attention(nn.Module):
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
+        isolation = attn_metadata.extra.get(REFERENCE_ISOLATION) if attn_metadata is not None else None
+        isolated_dense = None
+        if isolation is not None:
+            # Check before collectives or cache capture; switching semantics
+            # midway through a request would invalidate the reference cache.
+            if use_paged_attention or self.use_ring or self.causal or strategy.name not in {"none", "ulysses"}:
+                raise ValueError("H3 reference isolation requires noncausal local/pure-Ulysses attention")
+            if not isinstance(isolation, tuple) or len(isolation) != 2:
+                raise TypeError("reference isolation metadata must be a (state, compact) tuple")
+            isolated_dense = self._reference_isolation_dense_impl()
+
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        # MiniMax-H3 Tier2 stores reference K/V in the balanced layout produced
+        # by Ulysses. Keeping this hook at the generic post-parallel boundary
+        # avoids a model import in the parallel strategy and leaves other models
+        # untouched unless they explicitly provide the request-local state.
+        post_parallel_ref = (
+            attn_metadata.extra.get("minimax_h3_reference_kv_post_parallel") if attn_metadata is not None else None
+        )
+        if post_parallel_ref is not None:
+            if not isinstance(post_parallel_ref, tuple) or len(post_parallel_ref) != 3:
+                raise TypeError("minimax_h3_reference_kv_post_parallel must be a (state, layer_index, compact) tuple")
+            if self.use_ring:
+                raise NotImplementedError("post-Ulysses MiniMax-H3 reference KV requires ring_degree=1")
+            state, layer_index, compact = post_parallel_ref
+            processor = getattr(state, "process_post_parallel_layer", None)
+            if not callable(processor):
+                raise TypeError("MiniMax-H3 reference-KV state does not implement process_post_parallel_layer")
+            key, value = processor(
+                int(layer_index),
+                key,
+                value,
+                compact=bool(compact),
+                parallel_strategy=strategy.name,
+            )
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
@@ -639,7 +675,27 @@ class Attention(nn.Module):
             if self.use_ring and strategy is not self._no_parallel_strategy:
                 out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
-                out = self._run_local_attention(query, key, value, attn_metadata)
+                if isolation is None:
+                    out = self._run_local_attention(query, key, value, attn_metadata)
+                else:
+                    state, compact = isolation
+                    assert isolated_dense is not None
+                    assert self.attn_backend is not None
+                    logger.info_once(
+                        "MiniMax-H3 isolation attention active: reference=dense_rr, dynamic=%s",
+                        self.attn_backend.get_name(),
+                    )
+                    out = state.attend(
+                        query,
+                        key,
+                        value,
+                        attn_metadata,
+                        compact=compact,
+                        dense_forward=isolated_dense.forward,
+                        dynamic_forward=(
+                            self.attention.forward if self.attn_backend.get_name() == "RAINFUSION_ATTN" else None
+                        ),
+                    )
 
         if paged_sp_padding:
             padding_start = paged_sp_padding_offset - paged_sp_padding
@@ -758,6 +814,22 @@ class Attention(nn.Module):
         """Return whether this layer will use Scheduler-managed paged KV."""
 
         return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
+
+    def _reference_isolation_dense_impl(self) -> AttentionImpl:
+        if self.qkv_layout != "BSND":
+            raise ValueError("H3 reference isolation requires BSND Q/K/V")
+        backend_cls = self.attn_backend
+        if backend_cls is None:
+            raise ValueError("H3 reference isolation does not support custom attention")
+        backend = backend_cls.get_name()
+        if backend in {"FLASH_ATTN", "SDPA"}:
+            return self.attention
+        if backend == "RAINFUSION_ATTN":
+            fallback = getattr(self.attention, "dense_fallback", None)
+            if fallback is None:
+                raise ValueError("H3 reference isolation requires RainFusion's dense fallback")
+            return fallback
+        raise ValueError(f"H3 reference isolation does not support backend {backend!r}")
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:

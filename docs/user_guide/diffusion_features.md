@@ -32,6 +32,69 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### Experimental MiniMax-H3 Reference Isolation
+
+`--kv-isolate` changes MiniMax-H3's bidirectional attention: visual-reference
+queries read only visual-reference K/V, while other valid queries can read all
+valid K/V. A fixed reference condition timestep allows one reference-KV capture
+per request. Reuse uses pinned Host INT8 storage and asynchronous prefetch into
+a two-layer device ring, rather than retaining every layer's cache on device.
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va --kv-isolate
+```
+
+| Configuration | Behavior |
+|---------------|----------|
+| Neither KV flag | Existing model path |
+| Only `--kv-offload-config` | Existing periodic reference-KV refresh policy |
+| Only `--kv-isolate` | Isolation, one-time capture, Host INT8 and asynchronous prefetch |
+| Both flags | Same as isolation alone; the entire offload configuration is ignored |
+
+This option defaults to off and does not use an environment-variable switch.
+The initial implementation supports single-request full-loop inference with
+local attention or pure Ulysses, using Flash, SDPA or RainFusion. It rejects
+VDN-H3, ControlNet, latent editing, step execution, Ring/AllGather, scheduler-paged
+KV, multi-request packed inference and additional semantic masks. RainFusion
+can sparsify dynamic queries; reference queries execute reference-only dense
+attention. Cache-DiT history is invalidated at reference-version or layout
+boundaries; enabling isolation does not add a hit-priority refresh policy.
+
+**Isolation changes the learned model computation and can change prompt
+following, reference fidelity and shot timing. It is not a lossless optimization.**
+Evaluate output quality before deployment; this option does not establish that
+training or distillation is unnecessary. It is separate from cross-request
+prefix caching and does not establish support for other bidirectional models.
+
+#### MiniMax-H3 Reference Refresh with Cache-DiT
+
+Reference-KV offload defaults to a fixed refresh schedule. Set
+`cache_dit_policy` to `hit` to defer a due refresh when Cache-DiT hits:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
+  --cache-backend cache_dit \
+  --kv-offload-config '{"mode":"on","kv_refresh_interval":16,"cache_dit_policy":"hit","max_refresh_interval":32}'
+```
+
+The target age is measured from the last completed refresh. At a due step,
+Cache-DiT evaluates its normal prefix probe using the existing reference K/V.
+A hit defers refresh; a miss replays that step once in the full layout to
+refresh reference K/V before updating the solver. The replay does not advance
+the Cache-DiT step clock again. The maximum age forces a refresh regardless
+of hits and defaults to twice `kv_refresh_interval`.
+
+`cache_dit_policy="refresh"` keeps the original scheduling. Hit priority
+requires a positive refresh interval; an explicit maximum must be an integer
+at least as large as that interval and is accepted only with `hit`.
+Without the supported single Cache-DiT wrapper, or with separate-CFG caching,
+execution falls back to the original fixed schedule and logs the effective
+policy. Refresh/layout changes still invalidate incompatible residual and
+TaylorSeer history. No isolation mask or RainFusion kernel changes are involved.
+
+Longer reference reuse remains approximate. Evaluate quality and latency:
+prefix replay and history rebuilding can offset the saved block computation.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
