@@ -146,6 +146,7 @@ from .minimax_h3_transformer import (
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
+from .npu.component_residency import auxiliary_residency_enabled, is_resident_auxiliary, resident_auxiliary_plan
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
     load_minimax_h3_native_lora,
@@ -881,6 +882,7 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self._keep_components_resident = auxiliary_residency_enabled(od_config, device=self.device)
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
@@ -914,6 +916,8 @@ class MiniMaxH3Pipeline(
             encoder_block_attrs=encoder_block_attrs,
             on_demand_component_paths=frozenset(on_demand_component_paths),
         )
+        if self._keep_components_resident:
+            self._offload_plan = resident_auxiliary_plan(self._offload_plan)
         if not self.load_text_encoder:
             self._PROFILER_TARGETS.remove("encode_prompt")
         if not self.load_vae_encoder:
@@ -1115,8 +1119,10 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
-            offload_streams_blocks(od_config)
+        legacy_manual_components = (
+            not self._keep_components_resident
+            and getattr(od_config, "diffusion_offload_config", None) is None
+            and offload_streams_blocks(od_config)
         )
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
@@ -1158,7 +1164,9 @@ class MiniMaxH3Pipeline(
         )
 
         self._dlo_component_cache = None
-        offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
+        offloads_text_encoder = not self._keep_components_resident and should_offload_component(
+            od_config, TEXT_ENCODER_COMPONENT
+        )
         needs_component_cache = legacy_manual_components or offloads_text_encoder
         if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE and needs_component_cache:
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
@@ -1513,6 +1521,8 @@ class MiniMaxH3Pipeline(
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
+        if getattr(self, "_keep_components_resident", False) and is_resident_auxiliary(self, component):
+            return False
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
