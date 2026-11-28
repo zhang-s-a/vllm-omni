@@ -162,7 +162,19 @@ def _environment_accesses(path: Path) -> set[str]:
 
 def test_inventory_matches_reviewed_snapshot_counts():
     """Make an inventory expansion an explicit review decision."""
-    category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
+    # These two independent v0.32 release backports may be installed separately
+    # or together. Keep the original snapshot ratchet for all other entries.
+    h3_release_opt_ins = {
+        "VLLM_OMNI_MINIMAX_H3_AUDIO_TCONV_CONV1D",
+        "VLLM_OMNI_MINIMAX_H3_VAE_NPU_FUSION",
+    }
+    for name in h3_release_opt_ins & ENVIRONMENT_VARIABLE_INVENTORY.keys():
+        entry = ENVIRONMENT_VARIABLE_INVENTORY[name]
+        assert entry.category is EnvironmentVariableCategory.MODEL_SPECIFIC
+        assert entry.model_disposition is ModelEnvironmentVariableDisposition.PROMOTE
+    category_counts = Counter(
+        item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values() if item.name not in h3_release_opt_ins
+    )
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 33,
         EnvironmentVariableCategory.INHERITED_VLLM: 21,
@@ -175,7 +187,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
     disposition_counts = Counter(
         item.model_disposition
         for item in ENVIRONMENT_VARIABLE_INVENTORY.values()
-        if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
+        if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC and item.name not in h3_release_opt_ins
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
         ModelEnvironmentVariableDisposition.PROMOTE: 67,
