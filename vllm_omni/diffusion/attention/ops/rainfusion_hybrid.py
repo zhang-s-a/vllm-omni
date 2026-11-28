@@ -56,7 +56,7 @@ def _packing_cpu(length: int, spans: tuple[SpanSpec, ...], block_size: int):
         dense_parts.append(torch.arange(previous_end, length, dtype=torch.long))
     dense = torch.cat(dense_parts) if dense_parts else torch.empty(0, dtype=torch.long)
     parts = []
-    protected = set()
+    protected: set[int] = set()
     cursor = position = 0
     for index, (start, grid) in enumerate(spans):
         if position % block_size:

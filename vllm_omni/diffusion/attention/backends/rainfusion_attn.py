@@ -275,6 +275,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             int(attn_metadata.extra.get("minimax_h3_compact_reference_rows", 0)) if attn_metadata is not None else 0
         )
         if reference_rows:
+            assert attn_metadata is not None  # A nonzero row count came from this metadata.
             if self.qkv_layout != _INPUT_LAYOUT:
                 raise ValueError("RainFusion reference-KV reuse requires BSND layout")
             if key.shape != value.shape or key.shape[1] != query.shape[1] + reference_rows:

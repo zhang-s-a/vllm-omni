@@ -559,13 +559,18 @@ vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
   --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
 ```
 
-The JSON object accepts three keys:
+The JSON object has these three core keys:
 
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
 | `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
 | `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+
+The optional Cache-DiT hit-priority keys and the independent `--kv-isolate`
+flag retain their original precedence. See the
+[v0.32 Ascend reference-KV guide](../../docs/user_guide/diffusion/minimax_h3_a5_reference_kv.md)
+for the complete switch matrix and A5 validation limits.
 
 Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
 The current implementation requires one request per forward and either no

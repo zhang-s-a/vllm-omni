@@ -680,6 +680,7 @@ class Attention(nn.Module):
                 else:
                     state, compact = isolation
                     assert isolated_dense is not None
+                    assert self.attn_backend is not None
                     logger.info_once(
                         "MiniMax-H3 isolation attention active: reference=dense_rr, dynamic=%s",
                         self.attn_backend.get_name(),
@@ -817,11 +818,17 @@ class Attention(nn.Module):
     def _reference_isolation_dense_impl(self) -> AttentionImpl:
         if self.qkv_layout != "BSND":
             raise ValueError("H3 reference isolation requires BSND Q/K/V")
-        backend = self.attn_backend.get_name()
+        backend_cls = self.attn_backend
+        if backend_cls is None:
+            raise ValueError("H3 reference isolation does not support custom attention")
+        backend = backend_cls.get_name()
         if backend in {"FLASH_ATTN", "SDPA"}:
             return self.attention
         if backend == "RAINFUSION_ATTN":
-            return self.attention.dense_fallback
+            fallback = getattr(self.attention, "dense_fallback", None)
+            if fallback is None:
+                raise ValueError("H3 reference isolation requires RainFusion's dense fallback")
+            return fallback
         raise ValueError(f"H3 reference isolation does not support backend {backend!r}")
 
     def _run_local_attention(self, query, key, value, attn_metadata):
