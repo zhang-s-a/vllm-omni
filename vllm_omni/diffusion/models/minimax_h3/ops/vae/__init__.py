@@ -187,6 +187,10 @@ def install_h3_vae_optimizations(
 ) -> bool:
     """Install the operators selected for ``device`` once."""
 
+    if device.type == "npu":
+        from .npu_fusion import install_npu_vae_fusion
+
+        return install_npu_vae_fusion(decoder, device=device)
     if getattr(decoder, "_omni_h3_vae_optimizations_installed", False):
         return True
     operators = resolve_h3_vae_operators(device)
